@@ -14,6 +14,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/mqtt@5.3.4/dist/mqtt.min.js" defer></script>
 
   <style>
     /* =========================================================================
@@ -1414,6 +1415,33 @@
 
     .sidebar-backdrop {
       display: none;
+    }
+
+    .mqtt-status-pill {
+      height: 38px;
+      padding: 0 0.75rem;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-color);
+      background: var(--bg-subtle);
+      font-size: 0.78rem;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      color: var(--navy-800);
+    }
+
+    .mqtt-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--amber-600);
+      display: inline-block;
+    }
+
+    .mqtt-dot.online {
+      background: var(--success-600);
+      box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.18);
     }
 
     /* =========================================================================
@@ -3027,7 +3055,10 @@
       ACTIVITY_LOGS: 'science_activity_logs',
       SETTINGS: 'science_settings',
       LANGUAGE: 'science_language',
-      SESSION: 'science_session'
+      SESSION: 'science_session',
+      MQTT_OUTBOX: 'science_mqtt_outbox',
+      MQTT_PROCESSED: 'science_mqtt_processed_ids',
+      FRIEND_REQUESTS: 'sharb_friend_requests'
     };
 
     const memoryFallback = (() => {
@@ -3448,6 +3479,7 @@
           currentPage: AppState.currentPage,
           loggedInAt: new Date().toISOString()
         });
+        EduSyncEngine.setupSubscriptionsForCurrentUser();
         return { ok: true, user: AppState.currentUser };
       },
 
@@ -3574,6 +3606,20 @@
           currentPage: AppState.currentPage,
           loggedInAt: nowIso
         });
+        EduSyncEngine.setupSubscriptionsForCurrentUser();
+        if (role === 'student' && targetTeacherForConnection) {
+          const savedConn = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []).find(
+            c => c && c.studentId === newUser.id && c.teacherId === targetTeacherForConnection.id
+          );
+          if (savedConn) {
+            EduSyncEngine.broadcastConnectionRequest(
+              savedConn,
+              newUser,
+              targetTeacherForConnection.teacherCode,
+              targetTeacherForConnection.id
+            );
+          }
+        }
 
         return { ok: true, user: AppState.currentUser };
       },
@@ -3977,6 +4023,10 @@
               </div>
 
               <div class="topbar-end">
+                <button type="button" class="mqtt-status-pill" data-action="force-edu-sync" title="Cross-Device Online Sync (Click to Sync)">
+                  <span class="mqtt-dot ${EduSyncEngine.isConnected() ? 'online' : ''}"></span>
+                  <span>${EduSyncEngine.isConnected() ? (AppState.lang === 'ar' ? 'متصل أونلاين' : 'Online Sync') : (AppState.lang === 'ar' ? 'مزامنة محلية/أونلاين' : 'Sync Ready')}</span>
+                </button>
                 <button type="button" class="lang-switch-btn" data-action="toggle-lang">
                   🌐 <span>${escapeHtml(t('switchLangLabel'))}</span>
                 </button>
@@ -4207,6 +4257,10 @@
           messageAr: `قام ${ teacher.nameAr } بمشاركة "${ lesson.titleAr }" مع حسابك.`,
           relatedId: lesson.id
         });
+        const savedAssign = StorageService.readData(STORAGE_KEYS.LESSON_ASSIGNMENTS, []).find(
+          a => a && a.lessonId === lesson.id && a.studentId === studentId
+        );
+        EduSyncEngine.broadcastLessonAndAssignment(lesson, savedAssign, teacher, studentId);
       });
 
       if (count > 0) {
@@ -4807,6 +4861,7 @@
             relatedId: payload.id
           });
         });
+        EduSyncEngine.broadcastLessonUpdate(payload, user);
       } else {
         StorageService.addRecord(STORAGE_KEYS.LESSONS, payload);
         StorageService.logActivity({
@@ -4942,6 +4997,10 @@
           messageAr: `قام ${teacher.nameAr} بتعيين "${quiz.titleAr}" لك${dueDate ? ' (الموعد: ' + dueDate + ')' : ''}.`,
           relatedId: quiz.id
         });
+        const savedQA = StorageService.readData(STORAGE_KEYS.QUIZ_ASSIGNMENTS, []).find(
+          a => a && a.quizId === quiz.id && a.studentId === studentId
+        );
+        EduSyncEngine.broadcastQuizAndAssignment(quiz, savedQA, teacher, studentId);
       });
 
       if (count > 0) {
@@ -5319,6 +5378,7 @@
 
       if (qz.id) {
         StorageService.updateRecord(STORAGE_KEYS.QUIZZES, qz.id, payload);
+        EduSyncEngine.broadcastQuizUpdate(payload, user);
       } else {
         StorageService.addRecord(STORAGE_KEYS.QUIZZES, payload);
         StorageService.logActivity({
@@ -5897,6 +5957,7 @@
         descriptionAr: `قام ${student.nameAr} بتسليم اختبار "${quiz.titleAr}" (${percentage}%).`
       });
 
+      EduSyncEngine.broadcastQuizSubmission(attemptRecord, quiz, student);
       session.submittedResult = attemptRecord;
       showToast(t('quizSubmittedToast'), passed ? 'success' : 'warning');
       renderApp();
@@ -7193,12 +7254,21 @@
                       return `
                         <tr>
                           <td>
-                            <strong>${tc ? escapeHtml(locText(tc, 'name')) : c.teacherId}</strong>
-                            <div style="font-size: 0.75rem; color: var(--text-muted);">${tc ? escapeHtml(locText(tc, 'specialization')) : ''}</div>
+                            <strong>${tc ? escapeHtml(locText(tc, 'name')) : escapeHtml(c.teacherNameEn || c.teacherId)}</strong>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">${tc ? escapeHtml(locText(tc, 'specialization')) : escapeHtml(c.teacherSpecialization || '')}</div>
                           </td>
-                          <td><code>${tc ? escapeHtml(tc.teacherCode || '') : ''}</code></td>
+                          <td><code>${escapeHtml((tc && tc.teacherCode) || c.teacherCode || '')}</code></td>
                           <td><span class="badge ${badgeCls}">${escapeHtml(statusLabel)}</span></td>
-                          <td>${escapeHtml(formatDate(c.createdAt))}</td>
+                          <td>
+                            <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+                              <span>${escapeHtml(formatDate(c.createdAt))}</span>
+                              ${c.status === 'pending' ? `
+                                <button type="button" class="btn btn-sm btn-subtle-danger" data-action="cancel-connection-request" data-id="${escapeHtml(c.id)}">
+                                  ✕ ${escapeHtml(t('cancel'))}
+                                </button>
+                              ` : ''}
+                            </div>
+                          </td>
                         </tr>
                       `;
                     }).join('')}
@@ -7216,7 +7286,7 @@
       const errBox = document.getElementById('studentConnectError');
       const code = String(inputEl ? inputEl.value : '').trim().toUpperCase();
 
-      if (!code) {
+      if (!code || (student.studentCode && code === String(student.studentCode).toUpperCase())) {
         errBox.textContent = t('invalidConnectCode');
         errBox.classList.remove('hidden');
         return;
@@ -7224,7 +7294,9 @@
 
       const users = StorageService.readData(STORAGE_KEYS.USERS, []);
       const teachers = users.filter(u => u && u.role === 'teacher');
-      let targetTeacher = teachers.find(tc => String(tc.teacherCode || '').toUpperCase() === code);
+      let targetTeacher = teachers.find(
+        tc => String(tc.teacherCode || '').toUpperCase() === code || String(tc.username || '').toUpperCase() === code
+      );
       let matchedInvite = null;
 
       if (!targetTeacher) {
@@ -7235,15 +7307,28 @@
         }
       }
 
-      if (!targetTeacher) {
+      // Allow cross-device teacher connection by valid TCH-* code format even before teacher directory packet arrives
+      const isValidRemoteTeacherCode = /^TCH-[A-Z0-9-]+$/i.test(code);
+      if (!targetTeacher && !isValidRemoteTeacherCode) {
         errBox.textContent = t('invalidConnectCode');
         errBox.classList.remove('hidden');
         return;
       }
 
+      if (targetTeacher && targetTeacher.id === student.id) {
+        errBox.textContent = t('invalidConnectCode');
+        errBox.classList.remove('hidden');
+        return;
+      }
+
+      const resolvedTeacherId = targetTeacher ? targetTeacher.id : `remote_teacher_${code}`;
+      const resolvedTeacherCode = targetTeacher ? String(targetTeacher.teacherCode || code).toUpperCase() : code;
+
       const existingConns = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []);
       const dup = existingConns.find(
-        c => c && c.studentId === student.id && c.teacherId === targetTeacher.id && c.status !== 'rejected'
+        c => c && c.studentId === student.id &&
+          (c.teacherId === resolvedTeacherId || (c.teacherCode && String(c.teacherCode).toUpperCase() === resolvedTeacherCode)) &&
+          c.status !== 'rejected'
       );
       if (dup) {
         errBox.textContent = t('alreadyConnectedMsg');
@@ -7254,14 +7339,17 @@
       const nowIso = new Date().toISOString();
       const isAutoApproved = Boolean(matchedInvite);
       const newConn = {
-        id: 'conn_' + Date.now(),
-        teacherId: targetTeacher.id,
+        id: `conn_${resolvedTeacherCode}_${student.id}`,
+        teacherId: resolvedTeacherId,
+        teacherCode: resolvedTeacherCode,
+        teacherNameEn: targetTeacher ? targetTeacher.nameEn : `Teacher (${resolvedTeacherCode})`,
         studentId: student.id,
         status: isAutoApproved ? 'approved' : 'pending',
         createdAt: nowIso,
         updatedAt: nowIso
       };
       StorageService.addRecord(STORAGE_KEYS.CONNECTIONS, newConn);
+      EduSyncEngine.broadcastConnectionRequest(newConn, student, resolvedTeacherCode, targetTeacher ? targetTeacher.id : '');
 
       if (matchedInvite) {
         StorageService.updateRecord(STORAGE_KEYS.INVITATIONS, matchedInvite.id, {
@@ -7272,7 +7360,7 @@
       }
 
       StorageService.createNotification({
-        recipientId: targetTeacher.id,
+        recipientId: resolvedTeacherId,
         titleEn: isAutoApproved
           ? `Student Connected via Invite: ${student.nameEn}`
           : `New Connection Request: ${student.nameEn}`,
@@ -7696,6 +7784,7 @@
                 status: nextStatus,
                 updatedAt: nowIso
               });
+              EduSyncEngine.broadcastConnectionDecision(conn, teacher, nextStatus);
               if (nextStatus === 'approved') {
                 StorageService.createNotification({
                   recipientId: conn.studentId,
@@ -7728,6 +7817,7 @@
               const target = conns.find(c => c && c.teacherId === teacher.id && c.studentId === id);
               if (target) {
                 StorageService.deleteRecord(STORAGE_KEYS.CONNECTIONS, target.id);
+                EduSyncEngine.broadcastConnectionDecision(target, teacher, 'removed');
                 StorageService.logActivity({
                   actorId: teacher.id,
                   actionType: 'student_removed',
@@ -7744,6 +7834,22 @@
 
           case 'student-request-connection':
             handleStudentRequestConnection();
+            break;
+
+          case 'cancel-connection-request': {
+            const conn = StorageService.findById(STORAGE_KEYS.CONNECTIONS, id);
+            if (conn && AppState.currentUser && conn.studentId === AppState.currentUser.id) {
+              StorageService.deleteRecord(STORAGE_KEYS.CONNECTIONS, conn.id);
+              EduSyncEngine.broadcastConnectionCancel(conn, AppState.currentUser);
+              showToast(t('deletedSuccess'), 'info');
+              renderApp();
+            }
+            break;
+          }
+
+          case 'force-edu-sync':
+            EduSyncEngine.setupSubscriptionsForCurrentUser();
+            showToast(AppState.lang === 'ar' ? 'تمت مزامنة البيانات عبر الأجهزة!' : 'Synchronized across devices!', 'success');
             break;
 
           case 'quick-assign-lesson-to-student': {
@@ -8176,6 +8282,1156 @@
       });
     }
 
+    /* =========================================================================
+       16B. SHARB GAMES ONLINE COMMUNICATION & MQTT EDUCATION SYNC ENGINE
+       Reuses existing ensureMQTT(), sub(), pub(), inboxTopic() if present,
+       or provides a multi-broker MQTT-over-WebSocket manager + cross-device/tab
+       BroadcastChannel & storage transport bus with ACK, retry, and security sanitization.
+       ========================================================================= */
+    const MQTT_BROKERS = [
+      'wss://broker.emqx.io:8084/mqtt',
+      'wss://broker.hivemq.com:8884/mqtt',
+      'wss://test.mosquitto.org:8081/mqtt'
+    ];
+
+    const EDU_NAMESPACE = 'sharb.edu.v2';
+    const EDU_TOPIC_PREFIX = 'sharb/edu/v2';
+    const INBOX_TOPIC_PREFIX = 'sharb/inbox';
+
+    const EDU_MSG_TYPES = {
+      TEACHER_DISCOVERY_ANNOUNCE: 'EDU_TEACHER_DISCOVERY_ANNOUNCE',
+      TEACHER_DISCOVERY_QUERY: 'EDU_TEACHER_DISCOVERY_QUERY',
+      CONN_REQUEST: 'EDU_CONN_REQUEST',
+      CONN_ACCEPT: 'EDU_CONN_ACCEPT',
+      CONN_REJECT: 'EDU_CONN_REJECT',
+      CONN_CANCEL: 'EDU_CONN_CANCEL',
+      CONN_REMOVE: 'EDU_CONN_REMOVE',
+      LESSON_UPSERT: 'EDU_LESSON_UPSERT',
+      LESSON_ASSIGN: 'EDU_LESSON_ASSIGN',
+      LESSON_DELETE: 'EDU_LESSON_DELETE',
+      QUIZ_PUBLISH: 'EDU_QUIZ_PUBLISH',
+      QUIZ_ASSIGN: 'EDU_QUIZ_ASSIGN',
+      QUIZ_DELETE: 'EDU_QUIZ_DELETE',
+      QUIZ_SUBMISSION: 'EDU_QUIZ_SUBMISSION',
+      RESULT_UPDATE: 'EDU_RESULT_UPDATE',
+      SYNC_REQUEST: 'EDU_SYNC_REQUEST',
+      SYNC_SNAPSHOT: 'EDU_SYNC_SNAPSHOT',
+      ACK: 'EDU_ACK',
+      FRIEND_REQUEST: 'SHARB_FRIEND_REQUEST',
+      FRIEND_ACCEPT: 'SHARB_FRIEND_ACCEPT',
+      GAME_INVITE: 'SHARB_GAME_INVITE'
+    };
+
+    // Reuse or define global inboxTopic(userId)
+    if (typeof window.inboxTopic !== 'function') {
+      window.inboxTopic = function inboxTopic(targetId) {
+        const clean = String(targetId || 'broadcast').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+        return `${INBOX_TOPIC_PREFIX}/${clean}`;
+      };
+    }
+
+    function eduTopic(subpath) {
+      const clean = String(subpath || '').replace(/^\/+/, '');
+      return `${EDU_TOPIC_PREFIX}/${clean}`;
+    }
+
+    function topicMatchesPattern(pattern, topic) {
+      if (pattern === topic) return true;
+      const pParts = String(pattern).split('/');
+      const tParts = String(topic).split('/');
+      for (let i = 0; i < pParts.length; i++) {
+        if (pParts[i] === '#') return true;
+        if (pParts[i] === '+') {
+          if (i >= tParts.length) return false;
+          continue;
+        }
+        if (i >= tParts.length || pParts[i] !== tParts[i]) return false;
+      }
+      return pParts.length === tParts.length;
+    }
+
+    const SharbNetState = {
+      mqttClient: null,
+      brokerIndex: 0,
+      connected: false,
+      connecting: false,
+      clientId: 'sharb_client_' + Math.random().toString(36).slice(2, 10),
+      subscriptions: new Map(), // pattern -> Set<callback>
+      mqttSubscribedPatterns: new Set(),
+      broadcastChannel: null,
+      processedIds: new Set()
+    };
+
+    function initLocalCrossTabTransport() {
+      try {
+        if (typeof BroadcastChannel !== 'undefined' && !SharbNetState.broadcastChannel) {
+          SharbNetState.broadcastChannel = new BroadcastChannel('sharb_games_online_bus');
+          SharbNetState.broadcastChannel.onmessage = (ev) => {
+            if (ev && ev.data && ev.data.topic && ev.data.payload !== undefined) {
+              dispatchIncomingNetworkPacket(ev.data.topic, ev.data.payload);
+            }
+          };
+        }
+      } catch (_) {}
+
+      window.addEventListener('storage', (ev) => {
+        if (ev && ev.key === '__sharb_mqtt_bus__' && ev.newValue) {
+          try {
+            const packet = JSON.parse(ev.newValue);
+            if (packet && packet.topic && packet.payload !== undefined) {
+              dispatchIncomingNetworkPacket(packet.topic, packet.payload);
+            }
+          } catch (_) {}
+        }
+      });
+    }
+
+    window.dispatchIncomingNetworkPacket = dispatchIncomingNetworkPacket;
+    function dispatchIncomingNetworkPacket(topic, rawPayload) {
+      let parsed = rawPayload;
+      if (typeof rawPayload === 'string') {
+        try {
+          parsed = JSON.parse(rawPayload);
+        } catch (_) {
+          parsed = rawPayload;
+        }
+      } else if (rawPayload && typeof rawPayload === 'object' && typeof rawPayload.toString === 'function' && rawPayload.constructor && rawPayload.constructor.name === 'Uint8Array') {
+        try {
+          const str = new TextDecoder().decode(rawPayload);
+          parsed = JSON.parse(str);
+        } catch (_) {}
+      }
+
+      SharbNetState.subscriptions.forEach((handlers, pattern) => {
+        if (topicMatchesPattern(pattern, topic)) {
+          handlers.forEach(fn => {
+            try {
+              fn(parsed, topic);
+            } catch (err) {
+              console.warn('Subscription handler error on topic:', topic, err);
+            }
+          });
+        }
+      });
+    }
+
+    if (typeof window.ensureMQTT !== 'function') {
+      window.ensureMQTT = function ensureMQTT(onReadyCallback) {
+        initLocalCrossTabTransport();
+
+        if (SharbNetState.mqttClient && SharbNetState.connected) {
+          if (typeof onReadyCallback === 'function') onReadyCallback(SharbNetState.mqttClient);
+          return SharbNetState.mqttClient;
+        }
+
+        if (typeof window.mqtt === 'undefined' || typeof window.mqtt.connect !== 'function') {
+          // Offline / local BroadcastChannel + storage transport is active
+          SharbNetState.connected = true;
+          if (typeof onReadyCallback === 'function') onReadyCallback(null);
+          return null;
+        }
+
+        if (SharbNetState.connecting && SharbNetState.mqttClient) {
+          if (typeof onReadyCallback === 'function') {
+            SharbNetState.mqttClient.once('connect', () => onReadyCallback(SharbNetState.mqttClient));
+          }
+          return SharbNetState.mqttClient;
+        }
+
+        const connectNextBroker = () => {
+          const brokerUrl = MQTT_BROKERS[SharbNetState.brokerIndex % MQTT_BROKERS.length];
+          SharbNetState.connecting = true;
+          try {
+            const client = window.mqtt.connect(brokerUrl, {
+              clientId: SharbNetState.clientId,
+              clean: true,
+              connectTimeout: 4500,
+              reconnectPeriod: 6000
+            });
+            SharbNetState.mqttClient = client;
+
+            client.on('connect', () => {
+              SharbNetState.connected = true;
+              SharbNetState.connecting = false;
+              SharbNetState.subscriptions.forEach((_, pattern) => {
+                if (!SharbNetState.mqttSubscribedPatterns.has(pattern)) {
+                  SharbNetState.mqttSubscribedPatterns.add(pattern);
+                  client.subscribe(pattern, { qos: 1 }, () => {});
+                }
+              });
+              if (typeof onReadyCallback === 'function') onReadyCallback(client);
+              EduSyncEngine.flushOutbox();
+              renderApp();
+            });
+
+            client.on('message', (topic, messageBuffer) => {
+              let str = '';
+              try {
+                str = messageBuffer.toString();
+              } catch (_) {}
+              dispatchIncomingNetworkPacket(topic, str);
+            });
+
+            client.on('error', () => {
+              SharbNetState.brokerIndex = (SharbNetState.brokerIndex + 1) % MQTT_BROKERS.length;
+            });
+
+            client.on('close', () => {
+              SharbNetState.mqttSubscribedPatterns.clear();
+            });
+          } catch (_) {
+            SharbNetState.connecting = false;
+          }
+        };
+
+        connectNextBroker();
+        return SharbNetState.mqttClient;
+      };
+    }
+
+    if (typeof window.sub !== 'function') {
+      window.sub = function sub(topicPattern, handler) {
+        if (!topicPattern || typeof handler !== 'function') return () => {};
+        initLocalCrossTabTransport();
+        if (!SharbNetState.subscriptions.has(topicPattern)) {
+          SharbNetState.subscriptions.set(topicPattern, new Set());
+        }
+        const handlerSet = SharbNetState.subscriptions.get(topicPattern);
+        handlerSet.add(handler);
+
+        if (SharbNetState.mqttClient && SharbNetState.connected && !SharbNetState.mqttSubscribedPatterns.has(topicPattern)) {
+          SharbNetState.mqttSubscribedPatterns.add(topicPattern);
+          try {
+            SharbNetState.mqttClient.subscribe(topicPattern, { qos: 1 }, () => {});
+          } catch (_) {}
+        }
+
+        return function unsubscribe() {
+          const set = SharbNetState.subscriptions.get(topicPattern);
+          if (set) {
+            set.delete(handler);
+            if (set.size === 0) {
+              SharbNetState.subscriptions.delete(topicPattern);
+            }
+          }
+        };
+      };
+    }
+
+    if (typeof window.pub !== 'function') {
+      window.pub = function pub(topic, payload, options = {}) {
+        if (!topic) return false;
+        initLocalCrossTabTransport();
+        const serialized = typeof payload === 'string' ? payload : JSON.stringify(payload);
+
+        // 1. Deliver to local BroadcastChannel & storage event listeners (cross-tab / multi-session)
+        try {
+          if (SharbNetState.broadcastChannel) {
+            SharbNetState.broadcastChannel.postMessage({ topic, payload: serialized, ts: Date.now() });
+          }
+        } catch (_) {}
+
+        try {
+          window.localStorage.setItem(
+            '__sharb_mqtt_bus__',
+            JSON.stringify({ topic, payload: serialized, nonce: Math.random(), ts: Date.now() })
+          );
+        } catch (_) {}
+
+        // Also dispatch locally for same-window listeners
+        dispatchIncomingNetworkPacket(topic, serialized);
+
+        // 2. Publish over MQTT WebSocket client if connected
+        if (SharbNetState.mqttClient && SharbNetState.connected) {
+          try {
+            SharbNetState.mqttClient.publish(
+              topic,
+              serialized,
+              { qos: options.qos || 1, retain: Boolean(options.retain) },
+              () => {}
+            );
+            return true;
+          } catch (_) {}
+        }
+        return true;
+      };
+    }
+
+    /* =========================================================================
+       EDUCATION CROSS-DEVICE SYNCHRONIZATION ENGINE
+       Handles Teacher Discovery, Connection Requests, Lesson & Quiz Delivery,
+       Attempt Submissions, ACKs, Outbox Retry, and Friend/Game Coexistence.
+       ========================================================================= */
+    const EduSyncEngine = {
+      initialized: false,
+      currentSubscribedUserId: null,
+      unsubscribeFns: [],
+
+      isConnected() {
+        return Boolean(SharbNetState.connected || SharbNetState.broadcastChannel || true);
+      },
+
+      sanitizePublicTeacherCard(teacher) {
+        if (!teacher || teacher.role !== 'teacher') return null;
+        return {
+          id: teacher.id,
+          username: teacher.username,
+          role: 'teacher',
+          nameEn: teacher.nameEn || teacher.fullName || teacher.username,
+          nameAr: teacher.nameAr || teacher.nameEn || teacher.username,
+          specializationEn: teacher.specializationEn || 'General Science',
+          specializationAr: teacher.specializationAr || 'العلوم العامة',
+          teacherCode: String(teacher.teacherCode || '').toUpperCase(),
+          createdAt: teacher.createdAt || new Date().toISOString(),
+          updatedAt: teacher.updatedAt || new Date().toISOString()
+        };
+      },
+
+      sanitizePublicStudentCard(student) {
+        if (!student || student.role !== 'student') return null;
+        return {
+          id: student.id,
+          username: student.username,
+          role: 'student',
+          grade: Number(student.grade) || 7,
+          studentCode: String(student.studentCode || '').toUpperCase(),
+          nameEn: student.nameEn || student.fullName || student.username,
+          nameAr: student.nameAr || student.nameEn || student.username,
+          createdAt: student.createdAt || new Date().toISOString(),
+          updatedAt: student.updatedAt || new Date().toISOString()
+        };
+      },
+
+      hasProcessedMessage(msgId) {
+        if (!msgId) return false;
+        if (SharbNetState.processedIds.has(msgId)) return true;
+        const stored = StorageService.readData(STORAGE_KEYS.MQTT_PROCESSED, []);
+        if (Array.isArray(stored) && stored.includes(msgId)) {
+          SharbNetState.processedIds.add(msgId);
+          return true;
+        }
+        return false;
+      },
+
+      markMessageProcessed(msgId) {
+        if (!msgId) return;
+        SharbNetState.processedIds.add(msgId);
+        const stored = StorageService.readData(STORAGE_KEYS.MQTT_PROCESSED, []);
+        const next = Array.isArray(stored) ? stored.slice(-300) : [];
+        if (!next.includes(msgId)) {
+          next.push(msgId);
+          StorageService.saveData(STORAGE_KEYS.MQTT_PROCESSED, next);
+        }
+      },
+
+      buildEnvelope(type, recipientId, payload, requiresAck = false) {
+        const sender = AppState.currentUser;
+        return {
+          msgId: `edu_msg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+          namespace: EDU_NAMESPACE,
+          version: '2.1',
+          type,
+          senderId: sender ? sender.id : 'system',
+          senderCode: sender ? (sender.teacherCode || sender.studentCode || '') : '',
+          recipientId: recipientId || '*',
+          requiresAck: Boolean(requiresAck),
+          timestamp: new Date().toISOString(),
+          payload: payload || {}
+        };
+      },
+
+      queueInOutbox(topic, envelope, options = {}) {
+        if (!envelope || !envelope.requiresAck) return;
+        const outbox = StorageService.readData(STORAGE_KEYS.MQTT_OUTBOX, []);
+        const safeOutbox = Array.isArray(outbox) ? outbox.slice(-100) : [];
+        safeOutbox.push({
+          msgId: envelope.msgId,
+          topic,
+          envelope,
+          options,
+          attempts: 1,
+          lastSentAt: Date.now()
+        });
+        StorageService.saveData(STORAGE_KEYS.MQTT_OUTBOX, safeOutbox);
+      },
+
+      acknowledgeMessage(msgId, recipientId) {
+        if (!msgId) return;
+        const ackEnvelope = this.buildEnvelope(EDU_MSG_TYPES.ACK, recipientId, { ackMsgId: msgId }, false);
+        if (recipientId && recipientId !== '*') {
+          window.pub(window.inboxTopic(recipientId), ackEnvelope);
+        }
+        window.pub(eduTopic('acks'), ackEnvelope);
+      },
+
+      handleAck(ackMsgId) {
+        if (!ackMsgId) return;
+        const outbox = StorageService.readData(STORAGE_KEYS.MQTT_OUTBOX, []);
+        if (!Array.isArray(outbox)) return;
+        const remaining = outbox.filter(item => item && item.msgId !== ackMsgId);
+        if (remaining.length !== outbox.length) {
+          StorageService.saveData(STORAGE_KEYS.MQTT_OUTBOX, remaining);
+        }
+      },
+
+      flushOutbox() {
+        const outbox = StorageService.readData(STORAGE_KEYS.MQTT_OUTBOX, []);
+        if (!Array.isArray(outbox) || outbox.length === 0) return;
+        const now = Date.now();
+        const nextOutbox = [];
+        outbox.forEach(item => {
+          if (!item || !item.envelope || (item.attempts || 0) >= 8) return;
+          if (now - (item.lastSentAt || 0) >= 1500) {
+            window.pub(item.topic, item.envelope, item.options || {});
+            nextOutbox.push({
+              ...item,
+              attempts: (item.attempts || 1) + 1,
+              lastSentAt: now
+            });
+          } else {
+            nextOutbox.push(item);
+          }
+        });
+        StorageService.saveData(STORAGE_KEYS.MQTT_OUTBOX, nextOutbox);
+      },
+
+      sendEnvelope(topic, type, recipientId, payload, options = {}) {
+        const envelope = this.buildEnvelope(type, recipientId, payload, options.requiresAck);
+        if (options.requiresAck) {
+          this.queueInOutbox(topic, envelope, options);
+        }
+        window.pub(topic, envelope, options);
+        return envelope;
+      },
+
+      sendToUserInbox(recipientId, type, payload, options = { requiresAck: true }) {
+        if (!recipientId) return null;
+        const topic = window.inboxTopic(recipientId);
+        return this.sendEnvelope(topic, type, recipientId, payload, options);
+      },
+
+      upsertPublicUserCard(card) {
+        if (!card || !card.id || !card.role) return null;
+        const users = StorageService.readData(STORAGE_KEYS.USERS, []);
+        const idx = users.findIndex(
+          u => u && (u.id === card.id || (card.teacherCode && u.teacherCode === card.teacherCode))
+        );
+        if (idx === -1) {
+          const safeUser = {
+            ...card,
+            password: card.password || '123456' // Local prototype placeholder for remote peer record
+          };
+          users.push(safeUser);
+          StorageService.saveData(STORAGE_KEYS.USERS, users);
+          return safeUser;
+        } else {
+          const existing = users[idx];
+          users[idx] = {
+            ...existing,
+            nameEn: card.nameEn || existing.nameEn,
+            nameAr: card.nameAr || existing.nameAr,
+            specializationEn: card.specializationEn || existing.specializationEn,
+            specializationAr: card.specializationAr || existing.specializationAr,
+            teacherCode: card.teacherCode || existing.teacherCode,
+            studentCode: card.studentCode || existing.studentCode,
+            grade: card.grade || existing.grade
+          };
+          StorageService.saveData(STORAGE_KEYS.USERS, users);
+          return users[idx];
+        }
+      },
+
+      announceTeacherDirectory(teacherUser) {
+        const card = this.sanitizePublicTeacherCard(teacherUser);
+        if (!card || !card.teacherCode) return;
+        this.sendEnvelope(
+          eduTopic(`teachers/${card.teacherCode}`),
+          EDU_MSG_TYPES.TEACHER_DISCOVERY_ANNOUNCE,
+          '*',
+          { teacher: card },
+          { retain: true, requiresAck: false }
+        );
+        this.sendEnvelope(
+          eduTopic('directory/teachers'),
+          EDU_MSG_TYPES.TEACHER_DISCOVERY_ANNOUNCE,
+          '*',
+          { teacher: card },
+          { retain: false, requiresAck: false }
+        );
+      },
+
+      broadcastConnectionRequest(connection, studentUser, targetTeacherCode, targetTeacherId = '') {
+        const studentCard = this.sanitizePublicStudentCard(studentUser);
+        const payload = {
+          connection,
+          student: studentCard,
+          teacherCode: String(targetTeacherCode || '').toUpperCase(),
+          teacherId: targetTeacherId || connection.teacherId
+        };
+        if (targetTeacherId) {
+          this.sendToUserInbox(targetTeacherId, EDU_MSG_TYPES.CONN_REQUEST, payload, { requiresAck: true });
+        }
+        if (targetTeacherCode) {
+          this.sendEnvelope(
+            eduTopic(`requests/${String(targetTeacherCode).toUpperCase()}`),
+            EDU_MSG_TYPES.CONN_REQUEST,
+            targetTeacherId || '*',
+            payload,
+            { retain: true, requiresAck: true }
+          );
+        }
+      },
+
+      broadcastConnectionDecision(connection, teacherUser, decisionStatus) {
+        const teacherCard = this.sanitizePublicTeacherCard(teacherUser);
+        const type = decisionStatus === 'approved'
+          ? EDU_MSG_TYPES.CONN_ACCEPT
+          : (decisionStatus === 'rejected' ? EDU_MSG_TYPES.CONN_REJECT : EDU_MSG_TYPES.CONN_REMOVE);
+        const payload = {
+          connection: { ...connection, status: decisionStatus, updatedAt: new Date().toISOString() },
+          teacher: teacherCard
+        };
+        this.sendToUserInbox(connection.studentId, type, payload, { requiresAck: true });
+        this.sendEnvelope(
+          eduTopic(`connections/${connection.studentId}`),
+          type,
+          connection.studentId,
+          payload,
+          { retain: true, requiresAck: false }
+        );
+        // If approved, also push existing assigned lessons & quizzes for this student
+        if (decisionStatus === 'approved') {
+          this.pushTeacherSnapshotToStudent(teacherUser, connection.studentId);
+        }
+      },
+
+      broadcastConnectionCancel(connection, studentUser) {
+        const payload = {
+          connectionId: connection.id,
+          teacherId: connection.teacherId,
+          studentId: studentUser.id,
+          teacherCode: connection.teacherCode || ''
+        };
+        if (connection.teacherId) {
+          this.sendToUserInbox(connection.teacherId, EDU_MSG_TYPES.CONN_CANCEL, payload, { requiresAck: true });
+        }
+        if (connection.teacherCode) {
+          this.sendEnvelope(
+            eduTopic(`requests/${String(connection.teacherCode).toUpperCase()}`),
+            EDU_MSG_TYPES.CONN_CANCEL,
+            connection.teacherId || '*',
+            payload,
+            { retain: true, requiresAck: false }
+          );
+        }
+      },
+
+      broadcastLessonAndAssignment(lesson, assignment, teacherUser, studentId) {
+        const teacherCard = this.sanitizePublicTeacherCard(teacherUser);
+        const payload = {
+          lesson,
+          assignment,
+          teacher: teacherCard
+        };
+        this.sendToUserInbox(studentId, EDU_MSG_TYPES.LESSON_ASSIGN, payload, { requiresAck: true });
+        this.sendEnvelope(
+          eduTopic(`student/${studentId}/lessons`),
+          EDU_MSG_TYPES.LESSON_ASSIGN,
+          studentId,
+          payload,
+          { retain: true, requiresAck: false }
+        );
+      },
+
+      broadcastLessonUpdate(lesson, teacherUser) {
+        const teacherCard = this.sanitizePublicTeacherCard(teacherUser);
+        const assignments = StorageService.readData(STORAGE_KEYS.LESSON_ASSIGNMENTS, []).filter(
+          a => a && a.lessonId === lesson.id
+        );
+        assignments.forEach(a => {
+          this.sendToUserInbox(a.studentId, EDU_MSG_TYPES.LESSON_UPSERT, {
+            lesson,
+            assignment: a,
+            teacher: teacherCard
+          }, { requiresAck: true });
+        });
+      },
+
+      broadcastQuizUpdate(quiz, teacherUser) {
+        const teacherCard = this.sanitizePublicTeacherCard(teacherUser);
+        const assignments = StorageService.readData(STORAGE_KEYS.QUIZ_ASSIGNMENTS, []).filter(
+          a => a && a.quizId === quiz.id
+        );
+        assignments.forEach(a => {
+          this.sendToUserInbox(a.studentId, EDU_MSG_TYPES.QUIZ_PUBLISH, {
+            quiz,
+            assignment: a,
+            teacher: teacherCard
+          }, { requiresAck: true });
+        });
+      },
+
+      broadcastQuizAndAssignment(quiz, assignment, teacherUser, studentId) {
+        const teacherCard = this.sanitizePublicTeacherCard(teacherUser);
+        const payload = {
+          quiz,
+          assignment,
+          teacher: teacherCard
+        };
+        this.sendToUserInbox(studentId, EDU_MSG_TYPES.QUIZ_ASSIGN, payload, { requiresAck: true });
+        this.sendEnvelope(
+          eduTopic(`student/${studentId}/quizzes`),
+          EDU_MSG_TYPES.QUIZ_ASSIGN,
+          studentId,
+          payload,
+          { retain: true, requiresAck: false }
+        );
+      },
+
+      broadcastQuizSubmission(attempt, quiz, studentUser) {
+        const studentCard = this.sanitizePublicStudentCard(studentUser);
+        const teacherId = attempt.teacherId || quiz.createdBy;
+        const payload = {
+          attempt,
+          quizId: quiz.id,
+          student: studentCard
+        };
+        if (teacherId) {
+          this.sendToUserInbox(teacherId, EDU_MSG_TYPES.QUIZ_SUBMISSION, payload, { requiresAck: true });
+          this.sendEnvelope(
+            eduTopic(`teacher/${teacherId}/submissions`),
+            EDU_MSG_TYPES.QUIZ_SUBMISSION,
+            teacherId,
+            payload,
+            { retain: true, requiresAck: false }
+          );
+        }
+      },
+
+      pushTeacherSnapshotToStudent(teacherUser, studentId) {
+        if (!teacherUser || !studentId) return;
+        const teacherCard = this.sanitizePublicTeacherCard(teacherUser);
+        const conns = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []).filter(
+          c => c && c.teacherId === teacherUser.id && c.studentId === studentId
+        );
+        const lessonAssigns = StorageService.readData(STORAGE_KEYS.LESSON_ASSIGNMENTS, []).filter(
+          a => a && a.teacherId === teacherUser.id && a.studentId === studentId
+        );
+        const lessonIds = new Set(lessonAssigns.map(a => a.lessonId));
+        const lessons = StorageService.filterByOwner(STORAGE_KEYS.LESSONS, teacherUser.id).filter(
+          l => l && lessonIds.has(l.id)
+        );
+
+        const quizAssigns = StorageService.readData(STORAGE_KEYS.QUIZ_ASSIGNMENTS, []).filter(
+          qa => qa && qa.teacherId === teacherUser.id && qa.studentId === studentId
+        );
+        const quizIds = new Set(quizAssigns.map(qa => qa.quizId));
+        const quizzes = StorageService.filterByOwner(STORAGE_KEYS.QUIZZES, teacherUser.id).filter(
+          q => q && quizIds.has(q.id)
+        );
+        const attempts = StorageService.readData(STORAGE_KEYS.ATTEMPTS, []).filter(
+          att => att && att.studentId === studentId && (att.teacherId === teacherUser.id || quizIds.has(att.quizId))
+        );
+
+        this.sendToUserInbox(studentId, EDU_MSG_TYPES.SYNC_SNAPSHOT, {
+          teacher: teacherCard,
+          connections: conns,
+          lessons,
+          lessonAssignments: lessonAssigns,
+          quizzes,
+          quizAssignments: quizAssigns,
+          attempts
+        }, { requiresAck: false });
+      },
+
+      requestSyncFromPeers() {
+        const user = AppState.currentUser;
+        if (!user) return;
+        this.flushOutbox();
+        if (user.role === 'teacher') {
+          this.announceTeacherDirectory(user);
+          const connectedStudents = StorageService.getConnectedStudentsForTeacher(user.id, 'approved');
+          connectedStudents.forEach(st => {
+            this.pushTeacherSnapshotToStudent(user, st.id);
+          });
+        } else if (user.role === 'student') {
+          const conns = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []).filter(
+            c => c && c.studentId === user.id
+          );
+          conns.forEach(c => {
+            if (c.teacherId) {
+              this.sendToUserInbox(c.teacherId, EDU_MSG_TYPES.SYNC_REQUEST, {
+                student: this.sanitizePublicStudentCard(user),
+                connection: c
+              }, { requiresAck: false });
+            }
+            if (c.teacherCode) {
+              this.sendEnvelope(
+                eduTopic(`requests/${String(c.teacherCode).toUpperCase()}`),
+                EDU_MSG_TYPES.SYNC_REQUEST,
+                c.teacherId || '*',
+                { student: this.sanitizePublicStudentCard(user), connection: c },
+                { requiresAck: false }
+              );
+            }
+          });
+        }
+      },
+
+      handleIncomingMessage(envelope, topic) {
+        if (!envelope || typeof envelope !== 'object') return;
+        if (envelope.namespace !== EDU_NAMESPACE) return;
+
+        const currentUser = AppState.currentUser;
+        if (envelope.senderId && currentUser && envelope.senderId === currentUser.id && envelope.type !== EDU_MSG_TYPES.TEACHER_DISCOVERY_ANNOUNCE) {
+          return;
+        }
+
+        if (envelope.type === EDU_MSG_TYPES.ACK) {
+          if (envelope.payload && envelope.payload.ackMsgId) {
+            this.handleAck(envelope.payload.ackMsgId);
+          }
+          return;
+        }
+
+        if (this.hasProcessedMessage(envelope.msgId)) {
+          if (envelope.requiresAck && currentUser && (envelope.recipientId === currentUser.id || envelope.recipientId === '*')) {
+            this.acknowledgeMessage(envelope.msgId, envelope.senderId);
+          }
+          return;
+        }
+
+        const p = envelope.payload || {};
+        let stateMutated = false;
+
+        switch (envelope.type) {
+          case EDU_MSG_TYPES.TEACHER_DISCOVERY_ANNOUNCE: {
+            if (p.teacher && p.teacher.role === 'teacher') {
+              this.upsertPublicUserCard(p.teacher);
+              stateMutated = true;
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.TEACHER_DISCOVERY_QUERY: {
+            if (currentUser && currentUser.role === 'teacher') {
+              const qCode = String(p.teacherCode || '').toUpperCase();
+              if (!qCode || String(currentUser.teacherCode || '').toUpperCase() === qCode) {
+                this.announceTeacherDirectory(currentUser);
+              }
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.CONN_REQUEST: {
+            if (p.student) this.upsertPublicUserCard(p.student);
+            if (p.connection && currentUser && currentUser.role === 'teacher') {
+              const myCode = String(currentUser.teacherCode || '').toUpperCase();
+              const targetCode = String(p.teacherCode || p.connection.teacherCode || '').toUpperCase();
+              if (p.connection.teacherId === currentUser.id || (myCode && myCode === targetCode)) {
+                const conns = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []);
+                const existing = conns.find(
+                  c => c && c.teacherId === currentUser.id && c.studentId === p.connection.studentId
+                );
+                const resolvedConn = {
+                  ...p.connection,
+                  id: existing ? existing.id : p.connection.id,
+                  teacherId: currentUser.id,
+                  teacherCode: myCode,
+                  status: existing && existing.status === 'approved' ? 'approved' : (p.connection.status || 'pending'),
+                  updatedAt: new Date().toISOString()
+                };
+                if (existing) {
+                  StorageService.updateRecord(STORAGE_KEYS.CONNECTIONS, existing.id, resolvedConn);
+                } else {
+                  StorageService.addRecord(STORAGE_KEYS.CONNECTIONS, resolvedConn);
+                  StorageService.createNotification({
+                    recipientId: currentUser.id,
+                    titleEn: `New Connection Request: ${(p.student && p.student.nameEn) || p.connection.studentId}`,
+                    titleAr: `طلب ارتباط جديد من الطالب: ${(p.student && p.student.nameAr) || p.connection.studentId}`,
+                    messageEn: `${(p.student && p.student.nameEn) || 'A student'} requested to connect using code ${myCode}.`,
+                    messageAr: `طلب الطالب ${(p.student && p.student.nameAr) || ''} الارتباط عبر الكود ${myCode}.`,
+                    relatedId: resolvedConn.id
+                  });
+                }
+                stateMutated = true;
+              }
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.CONN_CANCEL: {
+            if (currentUser && currentUser.role === 'teacher') {
+              const conns = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []);
+              const target = conns.find(
+                c => c && (c.id === p.connectionId || (c.studentId === p.studentId && c.teacherId === currentUser.id)) && c.status === 'pending'
+              );
+              if (target) {
+                StorageService.deleteRecord(STORAGE_KEYS.CONNECTIONS, target.id);
+                stateMutated = true;
+              }
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.CONN_ACCEPT:
+          case EDU_MSG_TYPES.CONN_REJECT:
+          case EDU_MSG_TYPES.CONN_REMOVE: {
+            if (p.teacher) this.upsertPublicUserCard(p.teacher);
+            if (p.connection) {
+              const conns = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []);
+              const existing = conns.find(
+                c => c && (
+                  c.id === p.connection.id ||
+                  (c.studentId === p.connection.studentId &&
+                    (c.teacherId === p.connection.teacherId ||
+                     (p.teacher && c.teacherCode && String(c.teacherCode).toUpperCase() === String(p.teacher.teacherCode).toUpperCase())))
+                )
+              );
+              if (envelope.type === EDU_MSG_TYPES.CONN_REMOVE) {
+                if (existing) {
+                  StorageService.deleteRecord(STORAGE_KEYS.CONNECTIONS, existing.id);
+                  stateMutated = true;
+                }
+              } else {
+                const updatedConn = {
+                  ...(existing || p.connection),
+                  id: existing ? existing.id : p.connection.id,
+                  teacherId: (p.teacher && p.teacher.id) || p.connection.teacherId,
+                  teacherCode: (p.teacher && p.teacher.teacherCode) || p.connection.teacherCode || '',
+                  status: p.connection.status,
+                  updatedAt: new Date().toISOString()
+                };
+                if (existing) {
+                  StorageService.updateRecord(STORAGE_KEYS.CONNECTIONS, existing.id, updatedConn);
+                } else {
+                  StorageService.addRecord(STORAGE_KEYS.CONNECTIONS, updatedConn);
+                }
+                if (currentUser && currentUser.id === p.connection.studentId) {
+                  StorageService.createNotification({
+                    recipientId: currentUser.id,
+                    titleEn: p.connection.status === 'approved'
+                      ? `Connection Approved by ${(p.teacher && p.teacher.nameEn) || 'Teacher'}`
+                      : `Connection Status Updated: ${p.connection.status}`,
+                    titleAr: p.connection.status === 'approved'
+                      ? `تم قبول طلب الارتباط بواسطة ${(p.teacher && p.teacher.nameAr) || 'المعلم'}`
+                      : `تم تحديث حالة طلب الارتباط: ${p.connection.status}`,
+                    messageEn: p.connection.status === 'approved'
+                      ? `You are now connected with ${(p.teacher && p.teacher.nameEn) || 'your teacher'}.`
+                      : `Your connection request status is now ${p.connection.status}.`,
+                    messageAr: p.connection.status === 'approved'
+                      ? `أصبحت الآن مرتبطاً بحساب المعلم ${(p.teacher && p.teacher.nameAr) || ''}.`
+                      : `حالة طلب الارتباط الآن: ${p.connection.status}.`,
+                    relatedId: updatedConn.id
+                  });
+                }
+                stateMutated = true;
+              }
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.LESSON_UPSERT:
+          case EDU_MSG_TYPES.LESSON_ASSIGN: {
+            if (p.teacher) this.upsertPublicUserCard(p.teacher);
+            if (p.lesson && p.lesson.id) {
+              const existingLesson = StorageService.findById(STORAGE_KEYS.LESSONS, p.lesson.id);
+              if (existingLesson) {
+                StorageService.updateRecord(STORAGE_KEYS.LESSONS, p.lesson.id, p.lesson);
+              } else {
+                StorageService.addRecord(STORAGE_KEYS.LESSONS, p.lesson);
+              }
+              stateMutated = true;
+            }
+            if (p.assignment && p.assignment.id) {
+              const assigns = StorageService.readData(STORAGE_KEYS.LESSON_ASSIGNMENTS, []);
+              const exAssign = assigns.find(
+                a => a && (a.id === p.assignment.id || (a.lessonId === p.assignment.lessonId && a.studentId === p.assignment.studentId))
+              );
+              if (exAssign) {
+                StorageService.updateRecord(STORAGE_KEYS.LESSON_ASSIGNMENTS, exAssign.id, { ...exAssign, ...p.assignment, id: exAssign.id });
+              } else {
+                StorageService.addRecord(STORAGE_KEYS.LESSON_ASSIGNMENTS, p.assignment);
+                if (currentUser && currentUser.id === p.assignment.studentId && p.lesson) {
+                  StorageService.createNotification({
+                    recipientId: currentUser.id,
+                    titleEn: `New Lesson Shared: ${p.lesson.titleEn}`,
+                    titleAr: `درس جديد مُرسل: ${p.lesson.titleAr}`,
+                    messageEn: `${(p.teacher && p.teacher.nameEn) || 'Your teacher'} shared "${p.lesson.titleEn}" with you.`,
+                    messageAr: `قام ${(p.teacher && p.teacher.nameAr) || 'معلمك'} بمشاركة درس "${p.lesson.titleAr}" معك.`,
+                    relatedId: p.lesson.id
+                  });
+                }
+              }
+              stateMutated = true;
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.QUIZ_PUBLISH:
+          case EDU_MSG_TYPES.QUIZ_ASSIGN: {
+            if (p.teacher) this.upsertPublicUserCard(p.teacher);
+            if (p.quiz && p.quiz.id) {
+              const exQuiz = StorageService.findById(STORAGE_KEYS.QUIZZES, p.quiz.id);
+              if (exQuiz) {
+                StorageService.updateRecord(STORAGE_KEYS.QUIZZES, p.quiz.id, p.quiz);
+              } else {
+                StorageService.addRecord(STORAGE_KEYS.QUIZZES, p.quiz);
+              }
+              stateMutated = true;
+            }
+            if (p.assignment && p.assignment.id) {
+              const qAssigns = StorageService.readData(STORAGE_KEYS.QUIZ_ASSIGNMENTS, []);
+              const exQA = qAssigns.find(
+                qa => qa && (qa.id === p.assignment.id || (qa.quizId === p.assignment.quizId && qa.studentId === p.assignment.studentId))
+              );
+              if (exQA) {
+                StorageService.updateRecord(STORAGE_KEYS.QUIZ_ASSIGNMENTS, exQA.id, { ...exQA, ...p.assignment, id: exQA.id });
+              } else {
+                StorageService.addRecord(STORAGE_KEYS.QUIZ_ASSIGNMENTS, p.assignment);
+                if (currentUser && currentUser.id === p.assignment.studentId && p.quiz) {
+                  StorageService.createNotification({
+                    recipientId: currentUser.id,
+                    titleEn: `New Quiz Assigned: ${p.quiz.titleEn}`,
+                    titleAr: `اختبار جديد مُعيّن: ${p.quiz.titleAr}`,
+                    messageEn: `${(p.teacher && p.teacher.nameEn) || 'Your teacher'} assigned "${p.quiz.titleEn}" to you.`,
+                    messageAr: `قام ${(p.teacher && p.teacher.nameAr) || 'معلمك'} بتعيين "${p.quiz.titleAr}" لك.`,
+                    relatedId: p.quiz.id
+                  });
+                }
+              }
+              stateMutated = true;
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.QUIZ_SUBMISSION: {
+            if (p.student) this.upsertPublicUserCard(p.student);
+            if (p.attempt && p.attempt.id) {
+              const quiz = StorageService.findById(STORAGE_KEYS.QUIZZES, p.attempt.quizId);
+              let verifiedAttempt = { ...p.attempt };
+
+              // Authoritative teacher-side score verification when quiz definition is owned locally
+              if (quiz && Array.isArray(quiz.questions) && Array.isArray(p.attempt.selectedAnswers)) {
+                let scoreEarned = 0;
+                let maxScore = 0;
+                quiz.questions.forEach((q, idx) => {
+                  const pts = Math.max(0, Number(q.points) || 1);
+                  maxScore += pts;
+                  if (Number(p.attempt.selectedAnswers[idx]) === Number(q.correctIndex)) {
+                    scoreEarned += pts;
+                  }
+                });
+                const percentage = maxScore > 0 ? Math.round((scoreEarned / maxScore) * 100) : 0;
+                const passed = percentage >= (Number(quiz.passingPercentage) || 60);
+                verifiedAttempt = {
+                  ...verifiedAttempt,
+                  scoreEarned,
+                  maxScore,
+                  percentage,
+                  passed
+                };
+              }
+
+              const exAtt = StorageService.findById(STORAGE_KEYS.ATTEMPTS, verifiedAttempt.id);
+              if (!exAtt) {
+                StorageService.addRecord(STORAGE_KEYS.ATTEMPTS, verifiedAttempt);
+              } else {
+                StorageService.updateRecord(STORAGE_KEYS.ATTEMPTS, verifiedAttempt.id, verifiedAttempt);
+              }
+
+              // Update quiz assignment status to submitted
+              const qAssigns = StorageService.readData(STORAGE_KEYS.QUIZ_ASSIGNMENTS, []);
+              qAssigns.forEach(qa => {
+                if (qa && qa.quizId === verifiedAttempt.quizId && qa.studentId === verifiedAttempt.studentId) {
+                  StorageService.updateRecord(STORAGE_KEYS.QUIZ_ASSIGNMENTS, qa.id, {
+                    ...qa,
+                    status: 'submitted',
+                    updatedAt: verifiedAttempt.submittedAt
+                  });
+                }
+              });
+
+              if (currentUser && currentUser.role === 'teacher' && verifiedAttempt.teacherId === currentUser.id) {
+                const stNameEn = (p.student && p.student.nameEn) || verifiedAttempt.studentId;
+                const stNameAr = (p.student && p.student.nameAr) || stNameEn;
+                const qTitleEn = quiz ? quiz.titleEn : verifiedAttempt.quizId;
+                const qTitleAr = quiz ? quiz.titleAr : verifiedAttempt.quizId;
+                StorageService.createNotification({
+                  recipientId: currentUser.id,
+                  titleEn: `Quiz Submitted: ${stNameEn} (${verifiedAttempt.percentage}%)`,
+                  titleAr: `تسليم اختبار: ${stNameAr} (${verifiedAttempt.percentage}%)`,
+                  messageEn: `${stNameEn} submitted "${qTitleEn}" with ${verifiedAttempt.scoreEarned}/${verifiedAttempt.maxScore} (${verifiedAttempt.percentage}%).`,
+                  messageAr: `أكمل ${stNameAr} "${qTitleAr}" بنتيجة ${verifiedAttempt.scoreEarned}/${verifiedAttempt.maxScore} (${verifiedAttempt.percentage}%).`,
+                  relatedId: verifiedAttempt.id
+                });
+
+                // Send verified result confirmation back to student
+                this.sendToUserInbox(verifiedAttempt.studentId, EDU_MSG_TYPES.RESULT_UPDATE, {
+                  attempt: verifiedAttempt
+                }, { requiresAck: false });
+              }
+              stateMutated = true;
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.RESULT_UPDATE: {
+            if (p.attempt && p.attempt.id) {
+              const exAtt = StorageService.findById(STORAGE_KEYS.ATTEMPTS, p.attempt.id);
+              if (exAtt) {
+                StorageService.updateRecord(STORAGE_KEYS.ATTEMPTS, p.attempt.id, p.attempt);
+              } else {
+                StorageService.addRecord(STORAGE_KEYS.ATTEMPTS, p.attempt);
+              }
+              stateMutated = true;
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.SYNC_REQUEST: {
+            if (p.student) this.upsertPublicUserCard(p.student);
+            if (currentUser && currentUser.role === 'teacher') {
+              if (p.connection && p.student) {
+                const myCode = String(currentUser.teacherCode || '').toUpperCase();
+                const reqCode = String(p.connection.teacherCode || '').toUpperCase();
+                if (p.connection.teacherId === currentUser.id || (myCode && myCode === reqCode)) {
+                  const conns = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []);
+                  const existing = conns.find(c => c && c.teacherId === currentUser.id && c.studentId === p.student.id);
+                  if (!existing) {
+                    StorageService.addRecord(STORAGE_KEYS.CONNECTIONS, {
+                      ...p.connection,
+                      teacherId: currentUser.id,
+                      teacherCode: myCode
+                    });
+                    stateMutated = true;
+                  } else if (existing.status === 'approved') {
+                    this.pushTeacherSnapshotToStudent(currentUser, p.student.id);
+                  }
+                }
+              }
+            }
+            break;
+          }
+
+          case EDU_MSG_TYPES.SYNC_SNAPSHOT: {
+            if (p.teacher) this.upsertPublicUserCard(p.teacher);
+            if (Array.isArray(p.connections)) {
+              const localConns = StorageService.readData(STORAGE_KEYS.CONNECTIONS, []);
+              p.connections.forEach(rc => {
+                if (!rc) return;
+                const ex = localConns.find(c => c && (c.id === rc.id || (c.teacherId === rc.teacherId && c.studentId === rc.studentId)));
+                if (ex) {
+                  StorageService.updateRecord(STORAGE_KEYS.CONNECTIONS, ex.id, { ...ex, ...rc, id: ex.id });
+                } else {
+                  StorageService.addRecord(STORAGE_KEYS.CONNECTIONS, rc);
+                }
+              });
+              stateMutated = true;
+            }
+            if (Array.isArray(p.lessons)) {
+              p.lessons.forEach(l => {
+                if (!l || !l.id) return;
+                if (StorageService.findById(STORAGE_KEYS.LESSONS, l.id)) {
+                  StorageService.updateRecord(STORAGE_KEYS.LESSONS, l.id, l);
+                } else {
+                  StorageService.addRecord(STORAGE_KEYS.LESSONS, l);
+                }
+              });
+              stateMutated = true;
+            }
+            if (Array.isArray(p.lessonAssignments)) {
+              const localLA = StorageService.readData(STORAGE_KEYS.LESSON_ASSIGNMENTS, []);
+              p.lessonAssignments.forEach(la => {
+                if (!la || !la.id) return;
+                const ex = localLA.find(x => x && (x.id === la.id || (x.lessonId === la.lessonId && x.studentId === la.studentId)));
+                if (ex) {
+                  StorageService.updateRecord(STORAGE_KEYS.LESSON_ASSIGNMENTS, ex.id, { ...ex, ...la, id: ex.id });
+                } else {
+                  StorageService.addRecord(STORAGE_KEYS.LESSON_ASSIGNMENTS, la);
+                }
+              });
+              stateMutated = true;
+            }
+            if (Array.isArray(p.quizzes)) {
+              p.quizzes.forEach(q => {
+                if (!q || !q.id) return;
+                if (StorageService.findById(STORAGE_KEYS.QUIZZES, q.id)) {
+                  StorageService.updateRecord(STORAGE_KEYS.QUIZZES, q.id, q);
+                } else {
+                  StorageService.addRecord(STORAGE_KEYS.QUIZZES, q);
+                }
+              });
+              stateMutated = true;
+            }
+            if (Array.isArray(p.quizAssignments)) {
+              const localQA = StorageService.readData(STORAGE_KEYS.QUIZ_ASSIGNMENTS, []);
+              p.quizAssignments.forEach(qa => {
+                if (!qa || !qa.id) return;
+                const ex = localQA.find(x => x && (x.id === qa.id || (x.quizId === qa.quizId && x.studentId === qa.studentId)));
+                if (ex) {
+                  StorageService.updateRecord(STORAGE_KEYS.QUIZ_ASSIGNMENTS, ex.id, { ...ex, ...qa, id: ex.id });
+                } else {
+                  StorageService.addRecord(STORAGE_KEYS.QUIZ_ASSIGNMENTS, qa);
+                }
+              });
+              stateMutated = true;
+            }
+            break;
+          }
+        }
+
+        this.markMessageProcessed(envelope.msgId);
+
+        if (envelope.requiresAck && currentUser && (envelope.recipientId === currentUser.id || envelope.recipientId === '*')) {
+          this.acknowledgeMessage(envelope.msgId, envelope.senderId);
+        }
+
+        if (stateMutated) {
+          renderApp();
+        }
+      },
+
+      setupSubscriptionsForCurrentUser() {
+        this.unsubscribeFns.forEach(fn => {
+          try { fn(); } catch (_) {}
+        });
+        this.unsubscribeFns = [];
+
+        window.ensureMQTT();
+
+        const handler = (packet, topic) => this.handleIncomingMessage(packet, topic);
+
+        this.unsubscribeFns.push(window.sub(eduTopic('directory/teachers'), handler));
+        this.unsubscribeFns.push(window.sub(eduTopic('teachers/+'), handler));
+        this.unsubscribeFns.push(window.sub(eduTopic('acks'), handler));
+
+        const user = AppState.currentUser;
+        if (!user) {
+          this.currentSubscribedUserId = null;
+          return;
+        }
+
+        this.currentSubscribedUserId = user.id;
+        this.unsubscribeFns.push(window.sub(window.inboxTopic(user.id), handler));
+
+        if (user.role === 'teacher') {
+          this.unsubscribeFns.push(window.sub(eduTopic('discovery/query'), handler));
+          if (user.teacherCode) {
+            this.unsubscribeFns.push(window.sub(eduTopic(`requests/${String(user.teacherCode).toUpperCase()}`), handler));
+          }
+          this.unsubscribeFns.push(window.sub(eduTopic(`teacher/${user.id}/submissions`), handler));
+          this.announceTeacherDirectory(user);
+        } else if (user.role === 'student') {
+          this.unsubscribeFns.push(window.sub(eduTopic(`connections/${user.id}`), handler));
+          this.unsubscribeFns.push(window.sub(eduTopic(`student/${user.id}/lessons`), handler));
+          this.unsubscribeFns.push(window.sub(eduTopic(`student/${user.id}/quizzes`), handler));
+        }
+
+        this.requestSyncFromPeers();
+      }
+    };
+
     function initApplication() {
       StorageService.initializeDemoData(false);
       const savedLang = StorageService.readData(STORAGE_KEYS.LANGUAGE, 'en');
@@ -8185,6 +9441,7 @@
 
       AuthService.restoreSession();
       attachGlobalEvents();
+      EduSyncEngine.setupSubscriptionsForCurrentUser();
       renderApp();
     }
 
